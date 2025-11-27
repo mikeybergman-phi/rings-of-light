@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Rainbow Smoke Rings – Turbulent Liquid Visualizer</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #000;
+    overflow: hidden;
+    font-family: system-ui, sans-serif;
+    color: #eee;
+  }
+  #ui {
+    position: fixed;
+    top: 10px;
+    left: 10px;
+    padding: 8px 12px;
+    background: rgba(0,0,0,0.6);
+    border-radius: 8px;
+    backdrop-filter: blur(6px);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    z-index: 10;
+  }
+  #ui label {
+    font-size: 12px;
+  }
+  #ui input[type="file"] {
+    font-size: 12px;
+  }
+  #ui button {
+    background: #222;
+    border: 1px solid #444;
+    color: #eee;
+    padding: 4px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  #ui button:hover { background: #333; }
+  #brightness, #sensitivity, #turbulence {
+    width: 100px;
+  }
+  canvas {
+    display: block;
+  }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <label>
+    Audio
+    <input type="file" id="fileInput" accept="audio/*" />
+  </label>
+  <button id="useMic">Mic</button>
+  <label>
+    Brightness
+    <input type="range" id="brightness" min="0.2" max="2.0" step="0.01" value="1.0">
+  </label>
+  <label>
+    Sensitivity
+    <input type="range" id="sensitivity" min="0.5" max="4.0" step="0.05" value="2.0">
+  </label>
+  <label>
+    Turbulence
+    <input type="range" id="turbulence" min="0" max="3.0" step="0.01" value="1.2">
+  </label>
+</div>
+
+<canvas id="canvas"></canvas>
+<audio id="audio" crossorigin="anonymous" style="display:none;"></audio>
+
+<script>
+(() => {
+  const canvas = document.getElementById("canvas");
+  const ctx = canvas.getContext("2d");
+  let width = window.innerWidth;
+  let height = window.innerHeight;
+  canvas.width = width;
+  canvas.height = height;
+
+  // Offscreen buffer for per-ring distortion
+  const buffer = document.createElement("canvas");
+  const bctx = buffer.getContext("2d");
+  buffer.width = width;
+  buffer.height = height;
+
+  window.addEventListener("resize", () => {
+    width = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width = width;
+    canvas.height = height;
+    buffer.width = width;
+    buffer.height = height;
+  });
+
+  const audio = document.getElementById("audio");
+  const fileInput = document.getElementById("fileInput");
+  const useMicBtn = document.getElementById("useMic");
+  const brightSlider = document.getElementById("brightness");
+  const sensSlider = document.getElementById("sensitivity");
+  const turbSlider = document.getElementById("turbulence");
+
+  let audioCtx = null;
+  let analyser = null;
+  let freqData = null;
+  let source = null;
+
+  let rings = [];
+  let globalHue = 0;
+
+  // ------------ AUDIO ------------
+  function initAudio() {
+    if (!audioCtx)
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!analyser) {
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 2048;
+      freqData = new Uint8Array(analyser.frequencyBinCount);
+    }
+  }
+
+  function connectSource(node) {
+    if (source) try { source.disconnect(); } catch(e){}
+    source = node;
+    source.connect(analyser);
+    analyser.connect(audioCtx.destination);
+  }
+
+  fileInput.addEventListener("change", async e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    initAudio();
+    audio.src = URL.createObjectURL(f);
+    try {
+      await audio.play();
+      connectSource(audioCtx.createMediaElementSource(audio));
+    } catch (err) {
+      alert("Click the page once, then choose the file again.");
+    }
+  });
+
+  useMicBtn.addEventListener("click", async () => {
+    initAudio();
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      connectSource(audioCtx.createMediaStreamSource(stream));
+    } catch (err) {
+      alert("Mic access blocked.");
+    }
+  });
+
+  document.body.addEventListener("click", () => {
+    if (audioCtx && audioCtx.state === "suspended") {
+      audioCtx.resume();
+    }
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (audioCtx && audioCtx.state === "suspended") {
+      audioCtx.resume();
+    }
+  });
+
+  function getBands() {
+    if (!analyser) return { bass: 0, mid: 0, high: 0 };
+    analyser.getByteFrequencyData(freqData);
+
+    const len = freqData.length;
+    const bassEnd = Math.floor(len / 8);
+    const midEnd  = Math.floor(len * 3 / 8);
+    const highEnd = Math.floor(len * 7 / 8);
+
+    let b = 0, m = 0, h = 0, bc = 0, mc = 0, hc = 0;
+    for (let i = 0; i < len; i++) {
+      const v = freqData[i] / 255;
+      if (i < bassEnd) {
+        b += v; bc++;
+      } else if (i < midEnd) {
+        m += v; mc++;
+      } else if (i < highEnd) {
+        h += v; hc++;
+      }
+    }
+    return {
+      bass: bc ? b / bc : 0,
+      mid:  mc ? m / mc : 0,
+      high: hc ? h / hc : 0
+    };
+  }
+
+  // ------------ SMOKE RINGS ------------
+  const MAX_RINGS = 260;
+
+  function spawnRing(band, energy) {
+    const sens = parseFloat(sensSlider.value);
+    const e = Math.min(1, energy * sens);
+
+    // Random side off-screen
+    const side = Math.floor(Math.random() * 4); // 0=left,1=right,2=top,3=bottom
+    let x, y, vx, vy;
+
+    const speedBase = 80;           // px/s
+    const speedBoost = 420 * e;     // stronger with louder sound
+    const speed = speedBase + speedBoost;
+
+    if (side === 0) { // left
+      x = -100;
+      y = Math.random() * height;
+      vx = speed;
+      vy = (Math.random() - 0.5) * speed * 0.4;
+    } else if (side === 1) { // right
+      x = width + 100;
+      y = Math.random() * height;
+      vx = -speed;
+      vy = (Math.random() - 0.5) * speed * 0.4;
+    } else if (side === 2) { // top
+      x = Math.random() * width;
+      y = -100;
+      vx = (Math.random() - 0.5) * speed * 0.4;
+      vy = speed;
+    } else { // bottom
+      x = Math.random() * width;
+      y = height + 100;
+      vx = (Math.random() - 0.5) * speed * 0.4;
+      vy = -speed;
+    }
+
+    // Radii
+    const baseOuter = 40 + e * 80;
+    const maxOuter  = baseOuter * (1.8 + Math.random() * 0.8);
+    const thickness = 0.35 + Math.random() * 0.25; // relative
+
+    // Band → base hue range, then global drift
+    let baseHue;
+    if (band === "bass") {
+      // reds / magentas
+      baseHue = Math.random() < 0.5
+        ? 10 + Math.random() * 45   // 10–55
+        : 315 + Math.random() * 45; // 315–360
+    } else if (band === "mid") {
+      // greens / cyans
+      baseHue = 100 + Math.random() * 80; // 100–180
+    } else {
+      // blues / violets
+      baseHue = 210 + Math.random() * 90; // 210–300
+    }
+
+    const hue = (baseHue + globalHue) % 360;
+    const brightness = parseFloat(brightSlider.value);
+
+    rings.push({
+      band,
+      x, y,
+      vx, vy,
+      baseOuter,
+      maxOuter,
+      thickness,
+      created: performance.now() / 1000,
+      life: 2.5 + Math.random() * 3.0, // ~2.5–5.5s
+      hue,
+      sat: 96,
+      light: 48 + (brightness - 1) * 16
+    });
+
+    if (rings.length > MAX_RINGS) {
+      rings.splice(0, rings.length - MAX_RINGS);
+    }
+  }
+
+  // Per-ring local distortion: warp around each ring like a turbulent bubble
+  function applyPerRingDistortion(avgEnergy) {
+    const turb = parseFloat(turbSlider.value); // 0..3
+    if (turb <= 0 || rings.length === 0) return;
+
+    // Copy current frame into buffer for sampling
+    bctx.clearRect(0, 0, width, height);
+    bctx.drawImage(canvas, 0, 0);
+
+    ctx.save();
+    ctx.globalAlpha = 1;
+
+    const now = performance.now() / 1000;
+
+    for (const r of rings) {
+      const age = (now - r.created) / r.life;
+      const t = Math.max(0, Math.min(1, age));
+
+      // Use current outer radius estimate
+      const ease = 1 - Math.pow(1 - t, 3);
+      const outerRadius = r.baseOuter + (r.maxOuter - r.baseOuter) * ease;
+      const distortRadius = outerRadius * (1.4 + 0.4 * turb);
+
+      // Distortion strength and angle
+      const localEnergy = 0.5 + 0.5 * avgEnergy;
+      const angle = (0.08 * turb * localEnergy) * (r.band === "bass" ? 1.2 : 1.0);
+      const scale = 1 + 0.03 * turb * (0.5 + localEnergy);
+
+      ctx.save();
+      // Clip to circle around ring so distortion is local
+      ctx.beginPath();
+      ctx.arc(r.x, r.y, distortRadius, 0, Math.PI * 2);
+      ctx.clip();
+
+      // Transform that local region
+      ctx.translate(r.x, r.y);
+      ctx.rotate(angle);
+      ctx.scale(scale, scale);
+      ctx.translate(-r.x, -r.y);
+
+      ctx.drawImage(buffer, 0, 0);
+      ctx.restore();
+    }
+
+    ctx.restore();
+  }
+
+  function updateAndDrawRings(dt) {
+    const now = performance.now() / 1000;
+
+    // draw rings in normal compositing (no additive blowout)
+    ctx.globalCompositeOperation = "source-over";
+
+    for (let i = rings.length - 1; i >= 0; i--) {
+      const r = rings[i];
+      const age = now - r.created;
+      const t = age / r.life;
+
+      if (t >= 1 ||
+          r.x < -250 || r.x > width + 250 ||
+          r.y < -250 || r.y > height + 250) {
+        rings.splice(i, 1);
+        continue;
+      }
+
+      // Motion
+      r.x += r.vx * dt;
+      r.y += r.vy * dt;
+
+      // Growth
+      const ease = 1 - Math.pow(1 - t, 3);
+      const outerRadius = r.baseOuter + (r.maxOuter - r.baseOuter) * ease;
+      const innerRadius = outerRadius * (1 - r.thickness);
+
+      const alpha = (1 - t) * 0.85;
+
+      const brightness = parseFloat(brightSlider.value);
+      const innerLight = Math.min(92, r.light + 10 * brightness);
+      const midLight   = r.light;
+      const outerLight = Math.max(8, r.light - 25);
+
+      const grad = ctx.createRadialGradient(
+        r.x, r.y, innerRadius * 0.4,
+        r.x, r.y, outerRadius
+      );
+
+      grad.addColorStop(0.0, `hsla(${r.hue}, ${r.sat}%, ${innerLight}%, 0)`);
+      grad.addColorStop(0.4, `hsla(${r.hue}, ${r.sat}%, ${midLight}%, ${alpha * 0.9})`);
+      grad.addColorStop(0.7, `hsla(${r.hue}, ${r.sat}%, ${midLight}%, ${alpha * 0.7})`);
+      grad.addColorStop(1.0, `hsla(${r.hue}, ${r.sat}%, ${outerLight}%, 0)`);
+
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(r.x, r.y, outerRadius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // ------------ MAIN LOOP ------------
+  let lastTime = performance.now() / 1000;
+
+  function animate() {
+    requestAnimationFrame(animate);
+
+    const now = performance.now() / 1000;
+    let dt = now - lastTime;
+    if (dt > 0.05) dt = 0.05;
+    lastTime = now;
+
+    const { bass, mid, high } = getBands();
+    const sens = parseFloat(sensSlider.value);
+    const avgEnergy = (bass + mid + high) / 3 * sens;
+
+    // Slight global darkening -> keeps it as black liquid over time
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "rgba(0,0,0,0.10)";
+    ctx.fillRect(0, 0, width, height);
+
+    // Per-ring local turbulence (using previous frame in buffer)
+    applyPerRingDistortion(avgEnergy);
+
+    // Spawn new rings from off-screen for each band
+    function spawnBand(name, val, gain) {
+      const e = val * sens;
+      if (e <= 0.001) return;
+      let spawnFloat = e * gain;
+      let count = Math.floor(spawnFloat);
+      if (Math.random() < spawnFloat - count) count++;
+      for (let i = 0; i < count; i++) {
+        spawnRing(name, val);
+      }
+    }
+
+    spawnBand("bass", bass, 7.0);
+    spawnBand("mid",  mid,  5.0);
+    spawnBand("high", high, 4.0);
+
+    // Draw the updated rings
+    updateAndDrawRings(dt);
+
+    // Global rainbow drift
+    globalHue = (globalHue + 0.12) % 360;
+  }
+
+  // Seed a few rings so you see motion before audio
+  (function seedDemo() {
+    for (let i = 0; i < 10; i++) {
+      spawnRing("bass", 0.4 + Math.random() * 0.3);
+      spawnRing("mid",  0.3 + Math.random() * 0.4);
+      spawnRing("high", 0.3 + Math.random() * 0.4);
+    }
+  })();
+
+  animate();
+})();
+</script>
+</body>
+</html>
+
+
